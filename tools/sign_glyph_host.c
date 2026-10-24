@@ -17,6 +17,10 @@
  *                     w*h frame -> sign_otsu_threshold_strided
  *   mode 3  single glyph: <name>.raw is w*h grayscale -> sign_preprocess_glyph
  *   mode 4  luminance: <name>.raw is w*h*3 RGB -> sign_rgb_to_lum_u8
+ *   mode 5  capture resize: <name>.raw is a w*h GRAY frame; x0 is the
+ *           preprocessing side.  FrameResizeBoxAverageGray() downsamples it
+ *           to x0*x0, then preprocess_sign_sequence_c() runs exactly as in
+ *           mode 0.  Replays the 160->96 device chain against Python.
  *
  * mode 0 writes <name>.cmeta (threshold, sign box, per-slot boxes/flags) and
  * <name>.cglyphs (count packed out_size*out_size glyphs).  mode 1 writes
@@ -26,12 +30,18 @@
  *
  * The harness also cross-checks sign_scratch_bytes against sign_scratch_init,
  * so a mis-sized device scratch buffer fails here rather than on the ESP32.
+ *
+ * The parity corpus includes a white plate whose 'A' sits inside the old 6 %
+ * frame margin and whose '1' is broken into two strokes.  roi_box and every
+ * 28x28 glyph are compared with Python, so an edge-glyph erasure or a
+ * border-line bleed in sign_glyph.c fails here before it reaches the P4.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../sign_glyph.h"
+#include "../frame_resize.h"
 
 #define MAX_NAME 128
 
@@ -68,6 +78,7 @@ int main(int argc, char **argv) {
   /* The envelope is SIGN_MAX_PIXELS = 64K; the corpus is a handful of small
    * frames, so a couple of static buffers keep this harness malloc-free. */
   static uint8_t frame[SIGN_MAX_PIXELS * 3];
+  static uint8_t resized[SIGN_MAX_PIXELS];
   static uint8_t ink[SIGN_MAX_PIXELS];
   static uint8_t gray_buf[SIGN_MAX_PIXELS];
   static uint8_t glyphs[(size_t)SIGN_SEQUENCE_LEN * 64 * 64];
@@ -104,6 +115,18 @@ int main(int argc, char **argv) {
     if (!read_file(path, src, sizeof(frame), want)) {
       fprintf(stderr, "cannot read %s (%zu bytes)\n", path, want);
       return 1;
+    }
+
+    const uint8_t *seq_src = frame;
+    if (mode == 5) {
+      if (w != h || x0 <= 0 || x0 > SIGN_MAX_W ||
+          (int64_t)x0 * x0 > SIGN_MAX_PIXELS) {
+        fprintf(stderr, "case %s has a bad capture resize\n", name);
+        return 1;
+      }
+      FrameResizeBoxAverageGray(frame, w, resized, x0);
+      seq_src = resized;
+      w = h = x0;
     }
 
     if (mode == 2) {
@@ -215,7 +238,7 @@ int main(int argc, char **argv) {
 
     SignGlyphInfo info;
     const bool ok = preprocess_sign_sequence_c(
-        frame, w, h, out_size, count, order, (SignPolarity)polarity,
+        seq_src, w, h, out_size, count, order, (SignPolarity)polarity,
         seg != 0, min_run, thresh, dark_thr, (SignConvention)convention, &s,
         glyphs, slots, &info);
     if (!ok) {

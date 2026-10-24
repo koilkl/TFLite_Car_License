@@ -493,11 +493,15 @@ static void normalise_stretch(const uint8_t *src, int stride, int w, int h,
   }
 }
 
-/* Integer round-half-up division, positive and negative numerator.
- * Python: _round_half_up(num, den) — the same two branches. */
+/* Integer round-half-up on the real line: floor(num/den + 0.5).
+ * Python: _round_half_up(num, den) — Python's floor division makes
+ * (2*num + den) // (2*den) correct for negatives too; C division truncates
+ * toward zero, so negative quotients need an explicit floor. */
 static int round_half_up_i64(int64_t num, int64_t den) {
-  if (num >= 0) return (int)((2 * num + den) / (2 * den));
-  return (int)(-((-2 * num + den) / (2 * den)));
+  const int64_t a = 2 * num + den;
+  const int64_t b = 2 * den;
+  if (a >= 0) return (int)(a / b);
+  return (int)(-(((-a) + b - 1) / b));
 }
 
 /* Python ocr_preprocess._narrow_stroke_radius: how many pixels to widen a
@@ -685,7 +689,140 @@ static void glyph_zero(uint8_t *glyph_out, int out_size) {
   }
 }
 
-static bool preprocess_common(const uint8_t *gray, int w, int h, int out_size,
+/* Flood-fill one 8-connected ink component.  `visited` must be zero at the
+ * seed; every pixel of the component is set to `visit_value`.  Returns the
+ * seed index (raster-first pixel), which identifies the component. */
+static int32_t flood_component(uint8_t *ink, int w, int h, int sx, int sy,
+                               SignScratch *s, uint8_t visit_value,
+                               int *x1_out, int *y1_out,
+                               int *x2_out, int *y2_out, int *area_out) {
+  const size_t start = (size_t)sy * (size_t)w + (size_t)sx;
+  int top = 0;
+  int x1 = sx, y1 = sy, x2 = sx + 1, y2 = sy + 1, area = 0;
+  s->visited[start] = visit_value;
+  s->stack[top++] = (int32_t)start;
+  while (top > 0) {
+    const int32_t idx = s->stack[--top];
+    const int cy = (int)(idx / w);
+    const int cx = (int)(idx % w);
+    if (cx < x1) x1 = cx;
+    if (cx + 1 > x2) x2 = cx + 1;
+    if (cy < y1) y1 = cy;
+    if (cy + 1 > y2) y2 = cy + 1;
+    area++;
+    for (int dy = -1; dy <= 1; dy++) {
+      const int ny = cy + dy;
+      if (ny < 0 || ny >= h) continue;
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        const int nx = cx + dx;
+        if (nx < 0 || nx >= w) continue;
+        const size_t nidx = (size_t)ny * (size_t)w + (size_t)nx;
+        if (!ink[nidx] || s->visited[nidx]) continue;
+        s->visited[nidx] = visit_value;
+        s->stack[top++] = (int32_t)nidx;
+      }
+    }
+  }
+  if (x1_out) *x1_out = x1;
+  if (y1_out) *y1_out = y1;
+  if (x2_out) *x2_out = x2;
+  if (y2_out) *y2_out = y2;
+  if (area_out) *area_out = area;
+  return (int32_t)start;
+}
+
+/* Zero a component already marked visited==1, and set its gray pixels to the
+ * background so a removed speck cannot bias the intensity centring either. */
+static void clear_component(uint8_t *ink, uint8_t *gray, int w, int h,
+                            int32_t seed, SignScratch *s, uint8_t bg) {
+  if (!ink[seed]) return;
+  int top = 0;
+  s->visited[seed] = 3;
+  ink[seed] = 0;
+  gray[seed] = bg;
+  s->stack[top++] = seed;
+  while (top > 0) {
+    const int32_t idx = s->stack[--top];
+    const int cy = (int)(idx / w);
+    const int cx = (int)(idx % w);
+    for (int dy = -1; dy <= 1; dy++) {
+      const int ny = cy + dy;
+      if (ny < 0 || ny >= h) continue;
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        const int nx = cx + dx;
+        if (nx < 0 || nx >= w) continue;
+        const size_t nidx = (size_t)ny * (size_t)w + (size_t)nx;
+        if (!ink[nidx] || s->visited[nidx] != 1) continue;
+        s->visited[nidx] = 3;
+        ink[nidx] = 0;
+        gray[nidx] = bg;
+        s->stack[top++] = (int32_t)nidx;
+      }
+    }
+  }
+}
+
+/* Remove small disconnected specks touching the crop boundary.  Bit-for-bit
+ * mirror of ocr_preprocess.strip_border_specks():
+ *   dominant = largest 8-connected component;
+ *   keep any other component larger than 20 % of it, not touching the crop
+ *   boundary, or overlapping the dominant bbox in BOTH axes (a detached
+ *   fragment of a broken '1' shares the stem's columns);
+ *   drop the rest (the stray foot of a neighbouring glyph clipped by a
+ *   Manual ROI).  The gray pixels of dropped specks become background so
+ *   they cannot shift NORM_CANON's intensity centring. */
+static void strip_border_specks_c(uint8_t *ink, uint8_t *gray, int w, int h,
+                                  SignScratch *s, uint8_t bg) {
+  if (!ink || !gray || !s || !s->visited || !s->stack || w <= 0 || h <= 0) {
+    return;
+  }
+  const size_t frame = (size_t)w * (size_t)h;
+  memset(s->visited, 0, frame);
+
+  int32_t dom_seed = -1;
+  int dom_area = -1;
+  int dx1 = 0, dy1 = 0, dx2 = 0, dy2 = 0;
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      const size_t start = (size_t)y * (size_t)w + (size_t)x;
+      if (!ink[start] || s->visited[start]) continue;
+      int x1, y1, x2, y2, area;
+      flood_component(ink, w, h, x, y, s, 1, &x1, &y1, &x2, &y2, &area);
+      if (area > dom_area) {
+        dom_area = area;
+        dom_seed = (int32_t)start;
+        dx1 = x1; dy1 = y1; dx2 = x2; dy2 = y2;
+      }
+    }
+  }
+  if (dom_seed < 0 || dom_area <= 0) return;
+
+  memset(s->visited, 0, frame);
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      const size_t start = (size_t)y * (size_t)w + (size_t)x;
+      if (!ink[start] || s->visited[start]) continue;
+      int x1, y1, x2, y2, area;
+      const int32_t seed =
+          flood_component(ink, w, h, x, y, s, 1, &x1, &y1, &x2, &y2, &area);
+      if (seed == dom_seed) continue;
+      int keep = 1;
+      if (area * 100 <= 20 * dom_area) {
+        const int touches = (x1 == 0 || y1 == 0 || x2 == w || y2 == h);
+        if (touches) {
+          const int x_overlap = !(x2 <= dx1 || x1 >= dx2);
+          const int y_overlap = !(y2 <= dy1 || y1 >= dy2);
+          if (!(x_overlap && y_overlap)) keep = 0;
+        }
+      }
+      if (!keep) clear_component(ink, gray, w, h, seed, s, bg);
+    }
+  }
+}
+
+static bool preprocess_common(uint8_t *gray, int w, int h, int out_size,
                               SignPolarity polarity, bool apply_segmentation,
                               int min_run, int thresh, int dark_thr,
                               SignConvention convention, SignScratch *s,
@@ -716,6 +853,10 @@ static bool preprocess_common(const uint8_t *gray, int w, int h, int out_size,
 
   sign_binarize_ink(gray, n, t, polarity, s->ink);
   apply_dark_floor(gray, n, dark_thr, s->ink);
+  /* Single-glyph and per-slot crops: drop a neighbouring glyph's clipped
+   * corner speck before the bbox/metrics see it. */
+  strip_border_specks_c(s->ink, gray, w, h, s,
+                        (polarity == SIGN_INK_DARK) ? 255 : 0);
 
   bool any = false;
   for (size_t i = 0; i < n; i++) {
@@ -817,21 +958,57 @@ typedef struct {
   int area;
 } SignCand;
 
-static int iabs(int v) { return (v < 0) ? -v : v; }
 
-/* Returns true and fills roi/pct when a band was found.  Ink outside the ROI
- * is zeroed so the projection split only sees the characters. */
-static bool interior_roi_c(uint8_t *ink, int w, int h, SignScratch *s,
+/* True when the component bbox's surrounding ring is mostly plate.
+ * Mirrors ocr_preprocess._bright_margin bit-for-bit (RC2).
+ *
+ * A character sits on the white sign plate; room clutter sits on the dark
+ * surround.  The dilation ring of the bbox (the shared interior margin,
+ * clamped to the frame, minus the bbox itself) must be majority plate:
+ * bright (>= 128) for dark ink, dark (< 128) for bright ink.  The dark
+ * room clutter on the frame edges fails this and is discarded. */
+static bool bright_margin(const uint8_t *gray, int w, int h,
+                          int x, int y, int cw, int ch, int margin,
+                          SignPolarity polarity) {
+  int x1 = x - margin; if (x1 < 0) x1 = 0;
+  int y1 = y - margin; if (y1 < 0) y1 = 0;
+  int x2 = x + cw + margin; if (x2 > w) x2 = w;
+  int y2 = y + ch + margin; if (y2 > h) y2 = h;
+  if (x2 <= x1 || y2 <= y1) return false;
+  int total = 0;
+  int plate = 0;
+  for (int yy = y1; yy < y2; yy++) {
+    const uint8_t *row = gray + (size_t)yy * (size_t)w;
+    for (int xx = x1; xx < x2; xx++) {
+      if (xx >= x && xx < x + cw && yy >= y && yy < y + ch) continue;
+      total++;
+      const int v = (int)row[xx];
+      if (polarity == SIGN_INK_DARK) {
+        if (v >= 128) plate++;
+      } else {
+        if (v < 128) plate++;
+      }
+    }
+  }
+  return total > 0 && 2 * plate >= total;
+}
+
+/* Returns true and fills roi/pct when a lockable character cluster was
+ * found.  Ink outside the tight cluster is zeroed so the projection split
+ * only sees the characters.  Mirrors ocr_preprocess._interior_ink_components
+ * + _choose_sign_cluster bit-for-bit (RC2). */
+static bool interior_roi_c(uint8_t *ink, const uint8_t *gray, int w, int h,
+                           SignPolarity polarity, SignScratch *s,
                            SignBox *roi_out, float *pct_out) {
-  if (!ink || !s || !s->visited || !s->stack || w <= 0 || h <= 0) return false;
+  if (!ink || !gray || !s || !s->visited || !s->stack || w <= 0 || h <= 0) {
+    return false;
+  }
   const size_t frame = (size_t)w * (size_t)h;
   memset(s->visited, 0, frame);
 
   const int shorter = (w < h) ? w : h;
   int margin = (shorter * 6 + 50) / 100;
   if (margin < 2) margin = 2;
-  int min_area = (int)((frame * 4 + 5000) / 10000);
-  if (min_area < 6) min_area = 6;
 
   SignCand cand[INTERIOR_MAX_COMPONENTS];
   int ncand = 0;
@@ -870,15 +1047,20 @@ static bool interior_roi_c(uint8_t *ink, int w, int h, SignScratch *s,
         }
       }
 
+      /* The clutter filter: 1-2 px noise specks, components touching the
+       * outer frame border, huge background blobs (wider than 45 % or
+       * taller than 75 % of the frame), heights outside the 6 %..65 %
+       * character band, and blobs without a majority-plate ring are all
+       * discarded. */
       const int cw = x2 - x1;
       const int ch = y2 - y1;
-      if (area < min_area) continue;
-      if (x1 <= margin || y1 <= margin || x2 >= w - margin ||
-          y2 >= h - margin) {
+      if (area <= 2) continue;
+      if (x1 == 0 || y1 == 0 || x2 == w || y2 == h) continue;
+      if (cw * 100 > 45 * w || ch * 100 > 75 * h) continue;
+      if (ch * 100 < 6 * h || ch * 100 > 65 * h) continue;
+      if (!bright_margin(gray, w, h, x1, y1, cw, ch, margin, polarity)) {
         continue;
       }
-      if (cw * 100 > 85 * w || ch * 100 > 60 * h) continue;
-      if (area * 100 > 40 * (int)frame) continue;
       cand[ncand].box.x1 = x1;
       cand[ncand].box.y1 = y1;
       cand[ncand].box.x2 = x2;
@@ -888,32 +1070,29 @@ static bool interior_roi_c(uint8_t *ink, int w, int h, SignScratch *s,
     }
   }
 
-  if (ncand < 2) {
-    /* A sign needs at least two character components.  One component means
-     * a tight capture (or touching characters); cropping to it could discard
-     * edge glyphs, so leave the frame intact and let the split reconcile. */
-    long count = 0;
-    for (size_t i = 0; i < frame; i++) count += ink[i] ? 1 : 0;
-    if (pct_out) *pct_out = (float)(100.0 * (double)count / (double)frame);
-    return false;
-  }
+  /* Cluster lock: 2-4 vertically overlapping candidates whose union sits
+   * near the centre / lower-centre of the frame.  Groups are scored by
+   * (count, area); ties go to the earlier raster component.  Fewer than
+   * two candidates (a tight capture, or touching characters) means there
+   * is nothing to lock, so leave the frame intact and let the split
+   * reconcile. */
+  if (ncand < 2) goto no_cluster;
+
+  /* Every failure below reports the FULL-FRAME sign_pct, exactly like the
+   * Python None branch (preprocess_sign_sequence fills roi_box with the
+   * whole frame and measures sign_pct over it). */
 
   int best = 0;
   int best_count = -1;
   int best_total = -1;
   for (int i = 0; i < ncand; i++) {
-    const int ah = (cand[i].box.y2 - cand[i].box.y1 > 0)
-                       ? cand[i].box.y2 - cand[i].box.y1 : 1;
-    const int acy2 = 2 * cand[i].box.y1 + ah;
-    const int band2 = 2 * ah;
     int count = 0;
     int total = 0;
     for (int j = 0; j < ncand; j++) {
-      const int ch = cand[j].box.y2 - cand[j].box.y1;
-      const int cy2 = 2 * cand[j].box.y1 + ch;
-      if (iabs(cy2 - acy2) > band2) continue;
-      count++;
-      total += cand[j].area;
+      if (cand[i].box.y1 < cand[j].box.y2 && cand[i].box.y2 > cand[j].box.y1) {
+        count++;
+        total += cand[j].area;
+      }
     }
     if (count > best_count || (count == best_count && total > best_total)) {
       best_count = count;
@@ -921,22 +1100,23 @@ static bool interior_roi_c(uint8_t *ink, int w, int h, SignScratch *s,
       best = i;
     }
   }
+  if (best_count < 2 || best_count > 4) goto no_cluster;
 
-  const int ah = (cand[best].box.y2 - cand[best].box.y1 > 0)
-                     ? cand[best].box.y2 - cand[best].box.y1 : 1;
-  const int acy2 = 2 * cand[best].box.y1 + ah;
-  const int band2 = 2 * ah;
   int bx1 = w, by1 = h, bx2 = 0, by2 = 0;
   for (int j = 0; j < ncand; j++) {
-    const int ch = cand[j].box.y2 - cand[j].box.y1;
-    const int cy2 = 2 * cand[j].box.y1 + ch;
-    if (iabs(cy2 - acy2) > band2) continue;
-    if (cand[j].box.x1 < bx1) bx1 = cand[j].box.x1;
-    if (cand[j].box.y1 < by1) by1 = cand[j].box.y1;
-    if (cand[j].box.x2 > bx2) bx2 = cand[j].box.x2;
-    if (cand[j].box.y2 > by2) by2 = cand[j].box.y2;
+    if (cand[best].box.y1 < cand[j].box.y2 && cand[best].box.y2 > cand[j].box.y1) {
+      if (cand[j].box.x1 < bx1) bx1 = cand[j].box.x1;
+      if (cand[j].box.y1 < by1) by1 = cand[j].box.y1;
+      if (cand[j].box.x2 > bx2) bx2 = cand[j].box.x2;
+      if (cand[j].box.y2 > by2) by2 = cand[j].box.y2;
+    }
   }
-  if (bx2 <= bx1 || by2 <= by1) return false;
+  if (bx2 <= bx1 || by2 <= by1) goto no_cluster;
+
+  /* Compact cluster position: centred in the middle half of the frame, in
+   * the lower two thirds (Python _choose_sign_cluster). */
+  if (2 * (bx1 + bx2) < w || 2 * (bx1 + bx2) > 3 * w) goto no_cluster;
+  if (3 * (by1 + by2) < 2 * h) goto no_cluster;
 
   const int cw = bx2 - bx1;
   const int ch = by2 - by1;
@@ -972,6 +1152,69 @@ static bool interior_roi_c(uint8_t *ink, int w, int h, SignScratch *s,
     roi_out->x2 = rx2; roi_out->y2 = ry2;
   }
   return true;
+
+no_cluster:
+  {
+    long count = 0;
+    for (size_t i = 0; i < frame; i++) count += ink[i] ? 1 : 0;
+    if (pct_out) *pct_out = (float)(100.0 * (double)count / (double)frame);
+    return false;
+  }
+}
+
+/* Pinned threshold with the interior-Otsu fallback.  Mirrors Python
+ * _pinned_ink_with_otsu_fallback: when the pinned binarisation keeps fewer
+ * than 6 ink pixels inside the interior region, re-cut with Otsu computed
+ * ON that region (the dark floor is dropped — the 160->96 dilution already
+ * broke the user's luminance window).  Returns the threshold used and
+ * leaves the final ink mask in s->ink. */
+static int pinned_ink_fallback(const uint8_t *gray, int w, int h, int thresh,
+                               SignPolarity polarity, int dark_thr,
+                               SignScratch *s) {
+  const size_t n = (size_t)w * (size_t)h;
+  sign_binarize_ink(gray, n, thresh, polarity, s->ink);
+  apply_dark_floor(gray, n, dark_thr, s->ink);
+  const int shorter = (w < h) ? w : h;
+  int margin = (shorter * 6 + 50) / 100;
+  if (margin < 2) margin = 2;
+  int64_t interior_ink = 0;
+  if (h > 2 * margin && w > 2 * margin) {
+    for (int y = margin; y < h - margin; y++) {
+      for (int x = margin; x < w - margin; x++) {
+        if (s->ink[(size_t)y * (size_t)w + (size_t)x]) interior_ink++;
+      }
+    }
+  } else {
+    for (size_t i = 0; i < n; i++) {
+      if (s->ink[i]) interior_ink++;
+    }
+  }
+  if (interior_ink >= 6) return thresh;   /* _PINNED_MIN_INTERIOR_INK */
+  if (h > 2 * margin && w > 2 * margin) {
+    /* Copy the interior region into s->ink and Otsu it there: `gray` may
+     * BE s->gray (the single-glyph entry copies the frame there), and the
+     * ink mask was just counted and is about to be REPLACED by the
+     * re-binarisation, so s->ink is the one scratch buffer that is both
+     * free and guaranteed non-aliasing. */
+    const size_t m = (size_t)(h - 2 * margin) * (size_t)(w - 2 * margin);
+    size_t k = 0;
+    for (int y = margin; y < h - margin; y++) {
+      for (int x = margin; x < w - margin; x++) {
+        s->ink[k++] = gray[(size_t)y * (size_t)w + (size_t)x];
+      }
+    }
+    const int t2 = sign_otsu_threshold_u8(s->ink, m);
+    if (t2 != 0) {
+      sign_binarize_ink(gray, n, t2, polarity, s->ink);
+      return t2;
+    }
+    /* Interior Otsu had no split (a slot crop can be unimodal).  The copy
+     * above clobbered the mask, so restore the primary-pass result —
+     * Python's helper never overwrites its ink array. */
+    sign_binarize_ink(gray, n, thresh, polarity, s->ink);
+    apply_dark_floor(gray, n, dark_thr, s->ink);
+  }
+  return thresh;
 }
 
 bool preprocess_sign_sequence_c(const uint8_t *gray_in, int w, int h,
@@ -1011,28 +1254,31 @@ bool preprocess_sign_sequence_c(const uint8_t *gray_in, int w, int h,
   int t;
   if (thresh < 0) {
     t = sign_otsu_threshold_u8(gray_in, frame_px);
+    if (t == 0) {
+      /* Python: no valid split -> an all-zero ink mask.  The geometric
+       * split below still runs, so the caller gets its `count` crops. */
+      memset(scratch->ink, 0, frame_px);
+    } else {
+      sign_binarize_ink(gray_in, frame_px, t, polarity, scratch->ink);
+      apply_dark_floor(gray_in, frame_px, dark_thr, scratch->ink);
+    }
   } else {
-    t = thresh;
+    /* Pinned threshold (the Lum slider): fall back to interior Otsu when
+     * the pinned window wipes the diluted 160->96 strokes (RC2). */
+    t = pinned_ink_fallback(gray_in, w, h, thresh, polarity, dark_thr,
+                            scratch);
   }
   if (info) info->thresh = t;
 
-  if (t == 0 && thresh < 0) {
-    /* Python: no valid split -> an all-zero ink mask.  The geometric split
-     * below still runs, so the caller gets its `count` crops. */
-    memset(scratch->ink, 0, frame_px);
-  } else {
-    sign_binarize_ink(gray_in, frame_px, t, polarity, scratch->ink);
-    apply_dark_floor(gray_in, frame_px, dark_thr, scratch->ink);
-  }
-
-  /* Interior character-band ROI: the same border/speck/frame cleanup and
-   * tight padded box as ocr_preprocess.find_interior_ink_roi /
+  /* Interior character-cluster ROI: the RC2 clutter filter + cluster lock,
+   * mirrored from ocr_preprocess.find_interior_ink_roi /
    * preprocess_sign_sequence(find_roi=True).  With segmentation off the
    * caller already handed us the tight frame, so there is nothing to find. */
   if (apply_segmentation) {
     SignBox roi;
     float pct = 0.0f;
-    if (interior_roi_c(scratch->ink, w, h, scratch, &roi, &pct)) {
+    if (interior_roi_c(scratch->ink, gray_in, w, h, polarity, scratch,
+                       &roi, &pct)) {
       if (info) {
         info->has_roi = true;
         info->roi_box = roi;
@@ -1121,8 +1367,14 @@ bool preprocess_sign_sequence_c(const uint8_t *gray_in, int w, int h,
     }
 
     SignGlyphInfo slot_res;
+    /* The EFFECTIVE frame threshold (Python passes `t`): when the pinned
+     * window wiped the frame and the interior-Otsu fallback re-cut it, the
+     * slot crops must reuse that threshold — a slot crop is mostly glyph
+     * and its own Otsu is unimodal.  Otsu mode (-1) still re-Otsus per
+     * slot, exactly as the training transform does. */
     preprocess_common(scratch->gray, cw, ch, out_size, polarity,
-                      /* apply_segmentation = */ false, min_run, thresh,
+                      /* apply_segmentation = */ false, min_run,
+                      (thresh < 0) ? -1 : t,
                       dark_thr, convention, scratch,
                       glyphs_out + (size_t)idx * out_px, &slot_res);
     sl->thresh = slot_res.thresh;

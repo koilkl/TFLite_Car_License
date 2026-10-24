@@ -27,16 +27,17 @@ limitations under the License.
 // is the legacy 96x96 sign pipeline.  This folder is the `sign_ocr`
 // export target, and its model_settings.h carries the target sequence.
 // ═══════════════════════════════════════════════════════════════════════
-// USER CONFIG — edit these two values only (edit HERE, in this file)
+// RESOLUTION LAYERS — stamped into model_settings.h by Export Model
 //
-//   g_frame_side
-//     Capture / serial-stream resolution (8-512).  The camera libraries
-//     follow it at runtime (unified API, applied in setup()).  Same
-//     variable name as the camera-library example sketches.  The MODEL
-//     INPUT is one 28x28 glyph canvas (sign_glyph.h SIGN_GLYPH_SIZE),
-//     built from each of the three slots the split finds; to change it,
-//     re-export the model from AItraining at that img_size and update
-//     sign_glyph.h.
+//   TM_CAPTURE_FRAME_SIDE      camera / serial-stream side    (e.g. 160)
+//   TM_PREPROCESS_FRAME_SIDE   glyph front-end input side     (e.g. 96)
+//   TM_MODEL_INPUT_SIDE        one glyph canvas side          (28)
+//
+// They are deliberately independent.  The camera captures at 160×160; the
+// signature front-end runs on the 96×96 box-averaged frame (the same
+// resolution AItraining previews and the training captures use); each slot
+// is then resampled to the 28×28 model canvas.  g_frame_side is the CAPTURE
+// side only — never assume it equals the model input.
 //
 //   g_flip_180
 //     The camera is mounted upside down on the board; the library rotates
@@ -44,20 +45,30 @@ limitations under the License.
 //     Set to false only if your mount differs.
 //
 //   (constexpr here, unlike the examples, because this sketch sizes
-//    compile-time arrays from g_frame_side.)
+//    compile-time arrays from g_frame_side / g_preprocess_side.)
 // ═══════════════════════════════════════════════════════════════════════
-constexpr int  g_frame_side = 96;
-constexpr bool g_flip_180   = true;
-
 // #include <TensorFlowLite.h>
 
 #include "main_functions.h"
-#include "image_provider.h"
-#include "model_settings.h"
+#include "model_settings.h"   // before USER CONFIG: it carries the resolution sides
+#include "image_provider.h"   // includes frame_resize.h (box-average helper)
 // Include the exported model data header.
 // Rename this include to match your exported model's header file name,
 // e.g. "Square_model_data.h" or "MyModel_model_data.h".
 #include "tm_model_data.h"
+
+// Older exports predate the resolution macros: keep their 96×96 capture
+// behaviour, where capture and preprocessing were the same frame.
+#ifndef TM_CAPTURE_FRAME_SIDE
+#define TM_CAPTURE_FRAME_SIDE 96
+#endif
+#ifndef TM_PREPROCESS_FRAME_SIDE
+#define TM_PREPROCESS_FRAME_SIDE 96
+#endif
+
+constexpr int  g_frame_side      = 160;
+constexpr int  g_preprocess_side = TM_PREPROCESS_FRAME_SIDE;
+constexpr bool g_flip_180        = true;
 
 
 #include "tensorflow/lite/micro/micro_log.h"
@@ -155,23 +166,28 @@ static_assert(kTargetSignCount >= 1 && kTargetSignCount <= 16,
 #define SIGN_PLATE_CLASS(p, s) ((void)(p), kTargetSignClassIndices[(s)])
 #define SIGN_PLATE_TEXT(p) ((void)(p), kTargetSignSequence)
 #endif
-// Same class of tripwire for the USER CONFIG frame size.  The front-end
+// Same class of tripwire for the PREPROCESSING frame size.  The front-end
 // refuses frames outside sign_glyph.h's envelope (1 <= w <= SIGN_MAX_W,
-// w*h <= SIGN_MAX_PIXELS) and our caller passes w == h == g_frame_side, so the
-// whole envelope collapses to this one square-frame test.  Catching it here
-// beats catching it at runtime: an out-of-envelope frame is a legal USER
-// CONFIG value, the refuser is inside the library, and the observable symptom
-// would be three silently all-zero glyphs forever (they ARE zeroed, per the
-// header contract — they just never get any ink in them).
-static_assert(g_frame_side >= 1 && g_frame_side <= SIGN_MAX_W &&
-                  (int64_t)g_frame_side * g_frame_side <= SIGN_MAX_PIXELS,
-              "g_frame_side is outside sign_glyph.h's frame envelope "
+// w*h <= SIGN_MAX_PIXELS) and our caller passes w == h == g_preprocess_side,
+// so the whole envelope collapses to this one square-frame test.  The camera
+// capture side may be larger (160) — it is box-averaged down first, so it is
+// deliberately NOT the value tested here.
+static_assert(g_preprocess_side >= 1 && g_preprocess_side <= SIGN_MAX_W &&
+                  (int64_t)g_preprocess_side * g_preprocess_side <= SIGN_MAX_PIXELS,
+              "g_preprocess_side is outside sign_glyph.h's frame envelope "
               "(1 <= side <= SIGN_MAX_W and side^2 <= SIGN_MAX_PIXELS) — "
               "the glyph front-end would refuse every frame");
+// The camera library accepts 8..512-pixel output frames; the capture side is
+// only constrained by that and by RAM, not by the glyph envelope.
+static_assert(g_frame_side >= 8 && g_frame_side <= 512,
+              "g_frame_side (kCaptureFrameSide) must be 8..512");
+static_assert(g_preprocess_side <= g_frame_side,
+              "kPreprocessFrameSide must not exceed the capture side — the "
+              "device pipeline downscales, it never invents detail");
 // Rejection policy, exported by the host with the model:
 //   1 = each slot rejects with the model's own "_background" class; the OOD
 //       gates are opened instead of tuned, and the per-slot match rule (ink,
-//       not background, class target, prob >= kSignMatchMinProb) mirrors the
+//       not background, class target, prob >= s_sign_match_min_prob) mirrors the
 //       host preview.
 //   0 = no "_background" class was trained.  The standard OOD gates
 //       (kOodSignMinPct/MaxPct, kOodMaxProbMin, kOodEntropyRatioMax) compose
@@ -235,6 +251,17 @@ TfLiteTensor* input = nullptr;
 // Inference continues regardless; only the TX path is gated.
 static volatile bool s_transmit_enabled = true;
 
+// Per-slot confidence floor — RUNTIME, not kSignMatchMinProb.  The exported
+// constant is only the boot default; `set ood ... <mpmin> ...` (text and the
+// binary kCmdSetOodThresholds) updates this together with the OOD layer so a
+// lowered threshold reaches the slot match rule, not just Layers 2/3.
+static volatile float s_sign_match_min_prob = kSignMatchMinProb;
+static inline float sign_clamp01(float v) {
+  if (v < 0.0f) return 0.0f;
+  if (v > 1.0f) return 1.0f;
+  return v;
+}
+
 // RX diagnostics: count bytes and control packets received from S3.
 static volatile uint32_t s_rx_bytes = 0;
 static volatile uint32_t s_rx_ack_stop = 0;
@@ -272,19 +299,26 @@ static constexpr uint8_t kMsgTypeControl   = 0x02;  // S3 → P4 control message
 
 // ── UART verdict encoding (flags byte, 9-byte inference packet) ─────────
 // Low nibble 0x02 = "sign reader frame" (same as the other sketches).
-// High nibble is the verdict, and it is the ONLY discriminator receivers
-// need — backward compatible with S3 builds that know only 0x00 / 0xF0:
-//   0x00  MATCH      all three slots matched the target sequence
+// High nibble is the verdict:
+//   0x00  MATCH      all three slots matched ONE allowed plate (flags=0x02)
 //   0xE0  MISMATCH   sign present, but at least one slot did not match
-//   0xF0  NO SIGN    the frame has no ink at all (nothing to read)
-// label_id is the 0xFF sentinel ("verdict, not a class id"); confidence is
-// the MIN per-slot best raw score (0..255), so it means "the weakest slot".
+//                    any allowed plate (flags=0xE2)
+//   0xF0  NO SIGN    the frame has no ink at all (flags=0xF2)
+//
+// label_id (byte 5) says WHICH plate matched — this is the multi-plate
+// protocol the ESP32-S3 gatekeeper consumes:
+//   0 .. kTargetSignCount-1   MATCH, the matched plate index
+//   0xFE                      MISMATCH   (no plate matched all 3 slots)
+//   0xFF                      NO SIGN    (nothing to read)
+// confidence is the MIN per-slot best raw score (0..255), so it means
+// "the weakest slot".
 static constexpr uint8_t kFlagsSignReady     = 0x02;
 static constexpr uint8_t kFlagsVerdictMask   = 0xF0;
 static constexpr uint8_t kFlagsVerdictMatch  = 0x00;
 static constexpr uint8_t kFlagsVerdictMismatch = 0xE0;
 static constexpr uint8_t kFlagsVerdictNoSign = 0xF0;
-static constexpr uint8_t kSignVerdictLabel   = 0xFF;
+static constexpr uint8_t kSignMismatchLabel  = 0xFE;
+static constexpr uint8_t kSignNoSignLabel    = 0xFF;
 
 // S3 → P4 control commands
 static constexpr uint8_t kCtrlAckStop = 0x01;  // S3 confirmed sign → stop TX
@@ -932,8 +966,8 @@ static void ascii_print_help() {
     "  ping             → PONG\r\n"
     "  get mask         → MASK dark=?? lum=??  (G channel sign-mask)\r\n"
     "  set mask D L     → D=int L=int e.g.  set mask 30 85\r\n"
-    "  get ood          → OOD spmin..spmax mpmin ermax\r\n"
-    "  set ood A B C D  → 4 floats, e.g. set ood 0.5 70.0 0.7 0.65\r\n"
+    "  get ood          → OOD spmin..spmax mpmin ermax (mpmin = per-slot match floor)\r\n"
+    "  set ood A B C D  → 4 floats, e.g. set ood 0.5 70.0 0.4 0.65; C is also the per-slot match floor\r\n"
     "  get mode         → MODE infer|rgb|gray\r\n"
     "  mode infer       → normal inference + UART + SD\r\n"
     "  mode rgb         → pause, dump RAW RGB24 capture frames on serial\r\n"
@@ -960,8 +994,9 @@ static void ascii_dispatch(char *line) {
       Serial.printf("MASK: dark=%d lum=%d\r\n", d, l);
     } else if (0 == strcmp(tok, "ood")) {
       float a,b,c,d; ImageProviderGetOodThresholds(&a,&b,&c,&d);
-      Serial.printf("OOD: sp=%.2f..%.2f mp=%.3f er=%.3f\r\n",
-                    (double)a,(double)b,(double)c,(double)d);
+      Serial.printf("OOD: sp=%.2f..%.2f (disarmed) mp=%.3f er=%.3f match=%.3f\r\n",
+                    (double)a,(double)b,(double)c,(double)d,
+                    (double)s_sign_match_min_prob);
     } else if (0 == strcmp(tok, "mode")) {
       Serial.printf("MODE: %s\r\n", op_mode_name(s_op_mode));
     } else {
@@ -985,9 +1020,13 @@ static void ascii_dispatch(char *line) {
       if (!*a||!*b||!*c||!*d) { Serial.println(F("ERR: set ood <spmin> <spmax> <mpmin> <ermax>")); return; }
       float fa=(float)atof(a), fb=(float)atof(b), fc=(float)atof(c), fd=(float)atof(d);
       ImageProviderSetOodThresholds(fa,fb,fc,fd);
+      // The third argument (mpmin) is the per-slot confidence floor too:
+      // the slot match rule must follow the same knob the user just lowered.
+      s_sign_match_min_prob = sign_clamp01(fc);
       float a2,b2,c2,d2; ImageProviderGetOodThresholds(&a2,&b2,&c2,&d2);
-      Serial.printf("OK  OOD: sp=%.2f..%.2f mp=%.3f er=%.3f\r\n",
-                    (double)a2,(double)b2,(double)c2,(double)d2);
+      Serial.printf("OK  OOD: sp=%.2f..%.2f mp=%.3f er=%.3f match=%.3f\r\n",
+                    (double)a2,(double)b2,(double)c2,(double)d2,
+                    (double)s_sign_match_min_prob);
     } else {
       Serial.printf("ERR: unknown set '%s', try 'help'\r\n", tok);
     }
@@ -1086,8 +1125,10 @@ static void debug_serial_task(void *arg) {
           float mpmin = read_f32_le(pl + 8);
           float ermax = read_f32_le(pl + 12);
           ImageProviderSetOodThresholds(spmin, spmax, mpmin, ermax);
-          Serial.printf("DEBUG: OOD thresholds → sp=%.2f..%.2f mp=%.3f er=%.3f\n",
-                        (double)spmin, (double)spmax, (double)mpmin, (double)ermax);
+          s_sign_match_min_prob = sign_clamp01(mpmin);
+          Serial.printf("DEBUG: OOD thresholds → sp=%.2f..%.2f mp=%.3f er=%.3f match=%.3f\n",
+                        (double)spmin, (double)spmax, (double)mpmin, (double)ermax,
+                        (double)s_sign_match_min_prob);
           debug_send_ok(cmd);
         } break;
         case kCmdGetOodThresholds: {
@@ -1260,39 +1301,40 @@ static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id,
   if (total_raw_out) *total_raw_out = total_raw;
 }
 
-// Returns true iff the frame is "in-distribution" (we believe there's a real
-// sign in the picture).  Combines (1) sign_mask percentage from the camera
-// pipeline (Layer 1, pre-inference), (2) softmax top-1 probability
-// (Layer 2), and (3) normalised entropy of the distribution (Layer 3).  Any
-// rule that fires → OOD = false → caller should report "No Sign".
+// Returns true iff the slot is "in-distribution".  Layers 2 (top-1 raw
+// probability) and 3 (normalised entropy) are evaluated; Layer 1 (the
+// frame-level sign_pct percentage) is DISARMED on the 3-slot path — the
+// split already gates each slot on ink, and a frame-level window used to
+// reject all three correct slots at once.  `out_entropy_only` reports a
+// Layer-3-only failure so the caller can exempt a slot whose top class is
+// the plate target.  Any decisive rule that fires → OOD = false.
 static bool ood_is_in_distribution(float sign_pct, TfLiteTensor *output,
-                                   float *out_max_prob, float *out_entropy_ratio) {
+                                   float *out_max_prob, float *out_entropy_ratio,
+                                   bool *out_entropy_only = nullptr) {
+  if (out_entropy_only) *out_entropy_only = false;
 #if OOD_ENABLE != 1
   if (out_max_prob)     *out_max_prob = 1.0f;
   if (out_entropy_ratio) *out_entropy_ratio = 0.0f;
   return true;
 #else
-  float min_pct = 0.0f, max_pct = 0.0f, max_prob_min = 0.0f, entropy_max = 0.0f;
-  ImageProviderGetOodThresholds(&min_pct, &max_pct, &max_prob_min, &entropy_max);
+  float max_prob_min = 0.0f, entropy_max = 0.0f;
+  // Only Layers 2/3 thresholds are read; Layer 1 is disarmed below.
+  ImageProviderGetOodThresholds(nullptr, nullptr, &max_prob_min, &entropy_max);
 
-  // ── sign path: which rejector is authoritative? ───────────────────────
-  // sign_pct comes from sign_frame_ink_pct() (the current frame's in-window
-  // ink share), not from the legacy GetImage() path, so Layer 1 is real when
-  // the OOD policy is active.  With kSignBackgroundReplacesOod the
-  // model's explicit "_background" class is better information than the
-  // dark-pixel prior, so all three gates are opened and the per-slot match
-  // rule (ink + not background + class + prob >= kSignMatchMinProb) mirrors
-  // the host preview exactly.  The values below are still computed for logs.
+  // ── sign path: Layer 1 (sign_pct) is DISARMED ─────────────────────────
+  // sign_pct is a FRAME-level ink percentage.  On the 3-slot sign path the
+  // split already gates every slot on ink inside the character-band ROI;
+  // a frame-level window (especially one supplied by `set ood`) is too
+  // coarse and used to reject all three correct slots at once.  The value
+  // stays available for diagnostics, but it never rejects here.
+  (void)sign_pct;
+  // With kSignBackgroundReplacesOod the model's own "_background" class is
+  // the only rejector, so Layers 2/3 are opened as well; the per-slot match
+  // rule (ink + not background + class + prob >= match floor) still applies.
   if (kSignBackgroundReplacesOod) {
-    min_pct = 0.0f;
-    max_pct = 100.0f;
     max_prob_min = 0.0f;
     entropy_max = 0.0f;
   }
-
-  // Layer 1: sign-mask prior (cheapest; use first)
-  if (min_pct > 0.0f && sign_pct < min_pct) { if (out_max_prob) *out_max_prob = 0.0f; if (out_entropy_ratio) *out_entropy_ratio = 1.0f; return false; }
-  if (max_pct > 0.0f && sign_pct > max_pct) { if (out_max_prob) *out_max_prob = 0.0f; if (out_entropy_ratio) *out_entropy_ratio = 1.0f; return false; }
 
   // Aggregate raw scores for max_prob + entropy.  Use same [0,255] int-score
   // normalisation as pick_label_and_confidence to keep them consistent.
@@ -1334,7 +1376,10 @@ static bool ood_is_in_distribution(float sign_pct, TfLiteTensor *output,
   if (ent_ratio > 1.0f) ent_ratio = 1.0f;
   if (out_entropy_ratio) *out_entropy_ratio = ent_ratio;
 
-  if (entropy_max > 0.0f && ent_ratio > entropy_max) return false;
+  if (entropy_max > 0.0f && ent_ratio > entropy_max) {
+    if (out_entropy_only) *out_entropy_only = true;
+    return false;
+  }
   return true;
 #endif  // OOD_ENABLE == 1
 }
@@ -1380,8 +1425,15 @@ static inline void reset_accumulators() {
 // segmentation, then exactly SIGN_SEQUENCE_LEN boxes (merge/split/equal-thirds
 // reconciliation) and one normalised glyph per box.  Reading order is applied
 // by reversing the box list; pixels are never mirrored.
+//
+// RESOLUTION: the camera captures at g_frame_side (160 by default in a new
+// export) but the split runs at g_preprocess_side (96) — the host preview
+// box-averages the same 160→96, and the split's absolute-pixel heuristics
+// (border strip, min run) were tuned at that resolution.  The downscale is
+// the exact integer box average in frame_resize.h.
 static SignScratch s_sign_scratch;                 // views into s_sign_scratch_block
 static uint8_t   *s_sign_scratch_block = nullptr;
+static uint8_t    s_preprocess_gray[(size_t)g_preprocess_side * (size_t)g_preprocess_side];
 static uint8_t    s_slot_glyphs[SIGN_SEQUENCE_LEN][SIGN_GLYPH_SIZE * SIGN_GLYPH_SIZE];
 static SignSlotInfo s_slot_info[SIGN_SEQUENCE_LEN];
 static SignGlyphInfo s_sign_info;
@@ -1394,9 +1446,10 @@ static uint32_t   s_sign_empty = 0;   // frames where the split found no ink at 
 // One allocation at boot.  sign_scratch_bytes() is a pure function of the
 // geometry and a failure here is a build/config fact, not a transient
 // condition — so setup() halts rather than limping along producing garbage
-// glyphs from a half-initialised scratch.
+// glyphs from a half-initialised scratch.  Sized for the PREPROCESS side,
+// which is what the front-end actually reads.
 static bool sign_scratch_alloc() {
-  const size_t need = sign_scratch_bytes(g_frame_side, g_frame_side, SIGN_GLYPH_SIZE);
+  const size_t need = sign_scratch_bytes(g_preprocess_side, g_preprocess_side, SIGN_GLYPH_SIZE);
   const char *where = "internal SRAM";
   s_sign_scratch_block = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (s_sign_scratch_block == nullptr) {
@@ -1408,14 +1461,14 @@ static bool sign_scratch_alloc() {
     return false;
   }
   if (!sign_scratch_init(&s_sign_scratch, s_sign_scratch_block, need,
-                         g_frame_side, g_frame_side, SIGN_GLYPH_SIZE)) {
+                         g_preprocess_side, g_preprocess_side, SIGN_GLYPH_SIZE)) {
     Serial.printf("FATAL: sign scratch %u bytes is too small for %dx%d -> %dx%d.\r\n",
-                  (unsigned)need, g_frame_side, g_frame_side,
+                  (unsigned)need, g_preprocess_side, g_preprocess_side,
                   SIGN_SEQUENCE_LEN, SIGN_GLYPH_SIZE);
     return false;
   }
   Serial.printf("Sign scratch: %u bytes in %s (%dx%d gray -> %d slots of %d)\r\n",
-                (unsigned)need, where, g_frame_side, g_frame_side,
+                (unsigned)need, where, g_preprocess_side, g_preprocess_side,
                 SIGN_SEQUENCE_LEN, SIGN_GLYPH_SIZE);
   return true;
 }
@@ -1441,16 +1494,41 @@ static bool sign_feed_slots() {
   if (gray == nullptr) {
     return false;
   }
+  const uint8_t *frame = gray;
+  int frame_side = g_frame_side;
+  if (g_frame_side != g_preprocess_side) {
+    // Capture 160×160 -> front-end 96×96; same box average as the host.
+    FrameResizeBoxAverageGray(gray, g_frame_side,
+                              s_preprocess_gray, g_preprocess_side);
+    frame = s_preprocess_gray;
+    frame_side = g_preprocess_side;
+  }
+
+  // Dark / Lum are RUNTIME: setup() seeds them from the exported
+  // kBgDarkThresh/kBgLumThresh, and Serial `set mask D L` updates them.
+  // Derive the splitter's threshold exactly as the host preview does:
+  //   0/100            -> exact Otsu (-1), no floor
+  //   any other window -> threshold = clamp(lum - 1, 1, 254)
+  //                       floor     = dark <= 0 ? 0 : clamp(dark + 1, 0, 255)
+  int cur_dark = 0, cur_lum = 100;
+  ImageProviderGetMaskThresholds(&cur_dark, &cur_lum);
+  const bool mask_adjusted = (cur_dark != 0) || (cur_lum != 100);
+  const int pinned_thresh = mask_adjusted
+      ? (cur_lum - 1 < 1 ? 1 : (cur_lum - 1 > 254 ? 254 : cur_lum - 1))
+      : -1;
+  const int dark_thr = !mask_adjusted ? 0
+      : (cur_dark <= 0 ? 0
+                       : (cur_dark + 1 > 255 ? 255 : cur_dark + 1));
 
   const bool ok = preprocess_sign_sequence_c(
-      gray, g_frame_side, g_frame_side, SIGN_GLYPH_SIZE,
+      frame, frame_side, frame_side, SIGN_GLYPH_SIZE,
       SIGN_SEQUENCE_LEN,
       kSignReadingOrder,
       kSignPolarity,      /* captures: dark ink on a bright sign    */
       kSignSegment,
       kSignMinRun,        /* = 2, matches Python MIN_GLYPH_RUN      */
-      kSignPinnedThresh,  /* -1 = exact Otsu (0 is a PINNED 0)      */
-      kSignDarkThr,       /* 0 = no luminance floor                 */
+      pinned_thresh,      /* -1 = exact Otsu (0 is a PINNED 0)      */
+      dark_thr,           /* 0 = no luminance floor                 */
       kSignConvention,
       &s_sign_scratch, &s_slot_glyphs[0][0], s_slot_info, &s_sign_info);
   if (!ok) {
@@ -1814,18 +1892,25 @@ static void inference_task(void *arg) {
       // three gates and the model's background class decides, otherwise
       // Layers 1-3 compose with the match rule.
       float max_prob = 0.0f, entropy_ratio = 1.0f;
+      bool entropy_only = false;
       const bool in_distribution =
           ood_is_in_distribution(s_sign_info.sign_pct, output, &max_prob,
-                                 &entropy_ratio);
+                                 &entropy_ratio, &entropy_only);
       const bool is_background = is_background_id(slot_label[slot]);
 
       // A slot is READABLE independent of which plate we compare it to:
       // ink, a real class, OOD in-distribution and the confidence floor.
       // The plate loop below decides which target character it must equal.
+      // An entropy-only rejection is NOT decisive: if this slot's top class
+      // turns out to be an allowed plate's target character (and prob
+      // cleared the floor), the plate loop accepts it.  A correct reading
+      // used to be reported as NO because the model's class distribution
+      // can push entropy_ratio above 0.70 even when every top class is
+      // right.  sign_pct / max_prob still reject unconditionally.
       slot_accept[slot] = s_slot_info[slot].ok &&
-                          in_distribution &&
+                          (in_distribution || entropy_only) &&
                           !is_background &&
-                          prob >= kSignMatchMinProb;
+                          prob >= s_sign_match_min_prob;
       (void)max_prob;
       (void)entropy_ratio;
       (void)total_raw;
@@ -1881,7 +1966,7 @@ static void inference_task(void *arg) {
     // the top of the file):
     //   NO SIGN   no ink anywhere in the frame
     //   MISMATCH  a sign is present, but at least one slot did not match
-    //   MATCH     all three slots matched the target sequence
+    //   MATCH     all three slots matched ONE allowed plate
     // A MATCH therefore requires the ink check, the per-slot class check, the
     // "_background" rejection AND the confidence floor; one slot failing any
     // of them is a NO.
@@ -1896,10 +1981,14 @@ static void inference_task(void *arg) {
       pkt_flags = (uint8_t)((pkt_flags & 0x0F) | kFlagsVerdictMatch);
     }
 
-    // label_id / confidence carry diagnostics, not a class: 0xFF says "read
-    // the flags", and confidence is the WEAKEST slot's best raw score so a
+    // label_id carries the verdict detail the S3 needs to know WHICH car
+    // matched: the matched plate index on MATCH, 0xFE on MISMATCH, 0xFF on
+    // NO SIGN.  confidence is the WEAKEST slot's best raw score so a
     // receiver can gate on the same 0..255 scale as before (S3 uses 120).
-    const uint8_t label_id = kSignVerdictLabel;
+    uint8_t label_id = kSignNoSignLabel;
+    if (!no_sign) {
+      label_id = all_match ? (uint8_t)matched_plate : kSignMismatchLabel;
+    }
     const uint8_t confidence = (uint8_t)(slot_best_min < 0 ? 0
                                          : (slot_best_min > 255 ? 255 : slot_best_min));
 
@@ -1908,7 +1997,8 @@ static void inference_task(void *arg) {
       if (no_sign) {
         Serial.print("NO SIGN (frame has no ink)");
       } else if (all_match) {
-        Serial.printf("MATCH (YES) plate=%s", SIGN_PLATE_TEXT(matched_plate));
+        Serial.printf("MATCH (YES) plate#%d=%s", matched_plate + 1,
+                      SIGN_PLATE_TEXT(matched_plate));
       } else {
         Serial.print("NO MATCH (NO)");
       }
@@ -2108,11 +2198,23 @@ void setup() {
   delay(100);
   Serial.println("P4 TFLite start");
 
-  // USER CONFIG (top of this file): push g_frame_side + g_flip_180 into
+  // USER CONFIG (top of this file): push the CAPTURE side + g_flip_180 into
   // the camera library before any capture/inference code runs.
   ImageProviderConfigureCamera(g_frame_side, g_flip_180);
-  Serial.printf("Camera config: frame_side=%d flip_180=%d\r\n",
-                (int)g_frame_side, (int)g_flip_180);
+  // Apply the thresholds stamped into model_settings.h.  Without these
+  // calls ood_is_in_distribution() keeps image_provider.h's compile-time
+  // defaults and silently ignores the exported OOD policy / Dark-Lum mask.
+  ImageProviderSetOodThresholds(kOodSignMinPct, kOodSignMaxPct,
+                                kOodMaxProbMin, kOodEntropyRatioMax);
+  ImageProviderSetMaskThresholds(kBgDarkThresh, kBgLumThresh);
+  Serial.printf("Camera config: capture=%d preprocess=%d model=%d flip_180=%d\r\n",
+                (int)g_frame_side, (int)g_preprocess_side, (int)kNumCols,
+                (int)g_flip_180);
+  if (g_frame_side != g_preprocess_side) {
+    Serial.printf("Resolution: camera %dx%d -> box-average %dx%d -> glyph front-end\r\n",
+                  (int)g_frame_side, (int)g_frame_side,
+                  (int)g_preprocess_side, (int)g_preprocess_side);
+  }
 #if PREPROCESS_MODE == PREPROCESS_MODE_BG
   Serial.printf("Preprocess: B-G  | Camera: %s\n", CameraGetName());
 #elif PREPROCESS_MODE == PREPROCESS_MODE_GRAY
@@ -2125,21 +2227,21 @@ void setup() {
   // The model input is ONE 28x28 canvas per sign slot, built by sign_glyph.c
   // from the RAW library gray frame; GetImage() is never called on this path.
   Serial.printf("Preprocess: SIGN glyph (%dx%d gray -> %d slots of %d, ink=%s, %s, min_run=%d, thresh=%s)\r\n",
-                g_frame_side, g_frame_side, SIGN_SEQUENCE_LEN, SIGN_GLYPH_SIZE,
+                g_preprocess_side, g_preprocess_side, SIGN_SEQUENCE_LEN, SIGN_GLYPH_SIZE,
                 kSignPolarity == SIGN_INK_DARK ? "dark-on-bright" : "bright-on-dark",
                 kSignConvention == SIGN_NORM_CANON ? "NORM_CANON" : "NORM_STRETCH",
                 kSignMinRun,
                 kSignPinnedThresh < 0 ? "otsu" : "pinned");
-  Serial.printf("Sign target: \"%s\"  order=%s  match_min_prob=%.2f  window=(dark=%d, lum=%d)%s\r\n",
+  Serial.printf("Sign target: \"%s\"  order=%s  match_min_prob=%.2f (set ood adjusts)  window=(dark=%d, lum=%d)%s\r\n",
                 kTargetSignSequence,
                 kSignReadingOrder ? "RTL" : "LTR",
-                (double)kSignMatchMinProb,
+                (double)s_sign_match_min_prob,
                 (int)kExportDarkThr, (int)kExportLumThr,
                 kSignWindowAdjusted ? "  [sliders active]" : "  [defaults: exact Otsu]");
-  if (g_frame_side != 96) {
-    Serial.printf("WARNING: the sign training captures are 96x96 — a %d-wide frame is a "
-                  "different source resolution than the model was trained on.\r\n",
-                  g_frame_side);
+  if (g_preprocess_side != 96) {
+    Serial.printf("WARNING: the sign training captures are 96x96 — preprocessing at %d "
+                  "is a different source resolution than the model was trained on.\r\n",
+                  g_preprocess_side);
   }
   if (kSignBackgroundReplacesOod) {
     Serial.println("OOD: bypassed — each slot rejects with the model's \"_background\" class "
@@ -2460,13 +2562,13 @@ void setup() {
   if (kSignBackgroundReplacesOod) {
     Serial.printf("Sign labels: %d classes, rejection=_background (id %d) + %.2f floor\r\n",
                   (int)kCategoryCount, (int)background_class_id(),
-                  (double)kSignMatchMinProb);
+                  (double)s_sign_match_min_prob);
   } else {
-    Serial.printf("Sign labels: %d classes, rejection=OOD gates (sp=%.1f..%.1f "
-                  "mp>=%.2f er<=%.2f) + %.2f floor\r\n",
-                  (int)kCategoryCount, (double)kOodSignMinPct,
-                  (double)kOodSignMaxPct, (double)kOodMaxProbMin,
-                  (double)kOodEntropyRatioMax, (double)kSignMatchMinProb);
+    Serial.printf("Sign labels: %d classes, rejection=OOD mp>=%.2f er<=%.2f "
+                  "(sign_pct disarmed) + %.2f floor\r\n",
+                  (int)kCategoryCount,
+                  (double)kOodMaxProbMin, (double)kOodEntropyRatioMax,
+                  (double)s_sign_match_min_prob);
   }
 
   // ── The exported whitelist must address real, non-background classes ──
